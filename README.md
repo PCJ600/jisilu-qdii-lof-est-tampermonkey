@@ -1,24 +1,31 @@
-# 集思录亚洲 LOF 实时估值（Tampermonkey）
+# 集思录 QDII 估值脚本（Tampermonkey）
 
-在 [集思录 QDII · 亚洲市场](https://www.jisilu.cn/data/qdii/#qdiia) 表格中增加两列：
+本仓库包含 **两个** 油猴脚本，均只读当前页 DOM，不请求集思录 API。可按需分别安装。
 
-- **实时估值(95%无汇率)**
-- **实时溢价率**
-
-仅对名称含 **LOF** 的基金计算；**不额外请求**集思录或第三方 API，降低封号风险。
+| 脚本 | 页面 | 表格 |
+|------|------|------|
+| [`jisilu-qdiia-lof-estimate.user.js`](jisilu-qdiia-lof-estimate.user.js) | [亚洲市场 `#qdiia`](https://www.jisilu.cn/data/qdii/#qdiia) | `#flex_qdiia` |
+| [`jisilu-qdiie-t1-estimate.user.js`](jisilu-qdiie-t1-estimate.user.js) | [欧美市场 `#qdiie`](https://www.jisilu.cn/data/qdii/#qdiie) | `#flex_qdiie`（欧美）、`#flex_qdiic`（商品） |
 
 ---
 
-## 公式
+## 一、亚洲市场 · 实时估值（v1.4）
+
+在表格中增加：
+
+- **实时估值**（表头悬停：95% 仓位、无汇率）
+- **实时溢价率**
+
+**LOF / ETF** 同算法；**指数涨幅为 `-` / `--`** 时两列 **`-`**。
+
+**净值日期 vs 会话日（v1.4）**：若 **净值日期 ≥ 当前会话日**（晚间已公布当日净值，或周末会话日回退到周五），**实时估值** 为 `-`，**实时溢价率** 为 `(现价 − 净值) / 净值`。否则：
 
 ```text
 实时估值 = 净值 × (1 + 指数涨幅 × 95%)
 实时溢价率 = (现价 − 实时估值) / 实时估值 × 100%
 ```
 
-- **净值**：表格「净值」列（盘前为上一交易日净值；晚间更新后作为下一交易日基准）。
-- **指数涨幅**：表格「指数涨幅」列（如 `-0.47%`）。
-- **不考虑汇率**；股票仓位固定 **95%**。
+法定节假日未单独处理，与真实休市可能有偏差。
 
 ### 501305 验算
 
@@ -30,36 +37,38 @@
 | 现价 | 1.278 |
 | 实时溢价率 | ≈ -0.22% |
 
----
+### 安装与排查
 
-## 故障排查（页面空白 / 无表格）
-
-1. **先禁用脚本**，刷新 [QDII 亚洲市场](https://www.jisilu.cn/data/qdii/#qdiia)，确认不装脚本时表格能正常出现。
-2. 若仅装脚本后空白：请更新到 **v1.1.0+**（已修复 Observer 与 FlexGrid 冲突）。
-3. 在 Tampermonkey 中 **重新粘贴并保存** 最新 `jisilu-qdiia-lof-estimate.user.js`，硬刷新页面（Ctrl+F5）。
-4. 非会员无「30 秒自动刷新」：使用表格上方 **「刷新估值列」** 按钮手动重算。
-5. F12 → Console 搜索 `[集思录LOF估值]` 查看是否「列映射失败」。
+1. Tampermonkey 新建脚本，粘贴 `jisilu-qdiia-lof-estimate.user.js` 并保存。
+2. 登录集思录，打开 `#qdiia`；左下角 **「立即插入/刷新两列」**；Console 搜 `[集思录LOF估值]`。
+3. 点击 **实时溢价率** 表头可排序。
 
 ---
 
-## 安装
+## 二、欧美 / 商品 · T-1 日估值（v1.0）
 
-1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（Chrome / Edge / Firefox）。
-2. 新建脚本，粘贴 [`jisilu-qdiia-lof-estimate.user.js`](jisilu-qdiia-lof-estimate.user.js) 全文并保存。
-3. 浏览器 **登录** [集思录](https://www.jisilu.cn/)（完整基金列表需登录）。
-4. 打开 [https://www.jisilu.cn/data/qdii/#qdiia](https://www.jisilu.cn/data/qdii/#qdiia)，勾选「显示 LOF」等筛选后使用。
-5. 点击表头 **实时溢价率** 可对本页排序（降序 → 升序 → 取消）。
+同一 URL `#qdiie` 下 **两个表** 都会插列（欧美 + 商品）。
 
----
+- **T-1日估值**
+- **T-1日估值溢价率**
 
-## 技术说明
+```text
+T-1日估值 = T-2净值 × (1 + T-1指数涨幅 × 95%)
+T-1日估值溢价率 = (现价 − T-1日估值) / T-1日估值 × 100%
+```
 
-| 项目 | 说明 |
-|------|------|
-| 作用页面 | `#qdiia`，表格 `#flex_qdiia` |
-| 数据来源 | 只读当前页 DOM（现价、净值、指数涨幅） |
-| 刷新 | 跟随集思录「30 秒自动刷新」+ `MutationObserver` |
-| 与官方 IOPV | 本脚本 **不含汇率、固定 95% 仓位**，与集思录官方估值/IOPV 可能不一致 |
+| 表格 | 净值列 | 指数列 |
+|------|--------|--------|
+| 欧美 `#flex_qdiie` | T-2净值 | T-1指数涨幅 |
+| 商品 `#flex_qdiic` | T-2净值 | **参考标的期间涨幅**（非会员多为 `-` → 两列 `-`） |
+
+第一版 **不含** 亚洲脚本那种「净值日期 / 会话日停估」逻辑。
+
+### 安装
+
+1. Tampermonkey 再建 **第二个** 脚本，粘贴 `jisilu-qdiie-t1-estimate.user.js`。
+2. 打开 `#qdiie`；左下角 **`jsl-qdiie-t1-status`** 面板；Console 搜 `[集思录T-1估值]`。
+3. 可与亚洲脚本 **同时安装**（DOM 标记与面板 ID 不同）。
 
 ---
 
@@ -67,24 +76,22 @@
 
 ```bash
 node jisilu-qdiia-lof-calc.test.js
+node jisilu-qdiie-t1-calc.test.js
 ```
-
-计算逻辑见 [`jisilu-qdiia-lof-calc.js`](jisilu-qdiia-lof-calc.js)（与脚本内公式一致）。
-
----
-
-## 封号与合规
-
-- 脚本 **不会** 复制 Cookie 去调用 `qdii_list` 等接口。
-- 请勿同时运行对集思录 **高频抓包/爬虫** 的工具。
-- 仅供学习研究，**不构成投资建议**；模型有误差，套利需自行核实申购赎回规则与风险。
-
----
-
-## 文件
 
 | 文件 | 说明 |
 |------|------|
-| `jisilu-qdiia-lof-estimate.user.js` | Tampermonkey 主脚本 |
-| `jisilu-qdiia-lof-calc.js` | 计算模块 |
-| `jisilu-qdiia-lof-calc.test.js` | 单元测试 |
+| `jisilu-qdiia-lof-estimate.user.js` | 亚洲市场 Tampermonkey |
+| `jisilu-qdiia-lof-calc.js` / `*.test.js` | 亚洲计算与单测 |
+| `jisilu-qdiie-t1-estimate.user.js` | 欧美/商品 Tampermonkey |
+| `jisilu-qdiie-t1-calc.js` / `*.test.js` | T-1 计算与单测 |
+
+---
+
+## 通用说明
+
+| 项目 | 说明 |
+|------|------|
+| 仓位 / 汇率 | 固定 **95%**，**不含汇率**；与集思录官方 IOPV / T-1 估值可能不一致 |
+| 刷新 | 轮询 + `MutationObserver`；非会员可用手动刷新按钮 |
+| 合规 | 勿配合高频爬虫；**不构成投资建议** |

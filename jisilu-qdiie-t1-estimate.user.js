@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         集思录亚洲LOF实时估值(95%指数)
+// @name         集思录欧美/商品QDII T-1估值(95%指数)
 // @namespace    https://github.com/local/jisilu-qdiia-lof
-// @version      1.4.0
-// @description  在集思录 QDII 亚洲市场（LOF/ETF 等）增加「实时估值」「实时溢价率」
+// @version      1.0.0
+// @description  在集思录 QDII #qdiie 欧美(flex_qdiie)与商品(flex_qdiic)表增加 T-1日估值/T-1日估值溢价率
 // @author       local
 // @match        https://www.jisilu.cn/data/qdii/*
 // @icon         https://www.jisilu.cn/favicon.ico
@@ -15,42 +15,40 @@
   'use strict';
 
   const CONFIG = {
-    TABLE_ROOT_ID: 'flex_qdiia',
-    HASH: '#qdiia',
-    ESTIMATE_HEADER: '实时估值',
-    PREMIUM_HEADER: '实时溢价率',
+    HASH: '#qdiie',
+    TABLES: [
+      { id: 'flex_qdiie', label: '欧美' },
+      { id: 'flex_qdiic', label: '商品' },
+    ],
+    ESTIMATE_HEADER: 'T-1日估值',
+    PREMIUM_HEADER: 'T-1日估值溢价率',
     STOCK_RATIO: 0.95,
     POSITIVE_COLOR: '#c0392b',
     NEGATIVE_COLOR: '#27ae60',
     DEBOUNCE_MS: 400,
     POLL_FAST_MS: 600,
-    POLL_SLOW_MS: 3000,
-    POLL_SLOW_AFTER_MS: 120000,
   };
 
-  const MARK_EST = 'data-jsl-estimate-95';
-  const MARK_PREM = 'data-jsl-premium-95';
-  const MARK_HEADER_EST = 'data-jsl-estimate-header-95';
-  const MARK_HEADER_PREM = 'data-jsl-premium-header-95';
+  const MARK_EST = 'data-jsl-t1-estimate';
+  const MARK_PREM = 'data-jsl-t1-premium';
+  const MARK_HEADER_EST = 'data-jsl-t1-estimate-header';
+  const MARK_HEADER_PREM = 'data-jsl-t1-premium-header';
 
   let debounceTimer = null;
-  let bodyObserver = null;
+  /** @type {Map<string, MutationObserver>} */
+  const gridObservers = new Map();
+  /** @type {Map<string, 'asc'|'desc'|null>} */
+  const sortDirs = new Map();
   let hashListenerBound = false;
   let enhancing = false;
   let pollTimer = null;
-  let pollStartedAt = 0;
-  /** @type {Record<string, number>|null} */
-  let frozenColMap = null;
+  /** @type {Record<string, Record<string, number>>} */
+  let frozenColMaps = {};
 
   const status = {
-    version: '1.4.0',
+    version: '1.0.0',
     pageOk: false,
-    rootFound: false,
-    headerFound: false,
-    bodyFound: false,
-    ready: false,
-    colMap: null,
-    sessionDay: '',
+    tables: /** @type {Record<string, {found:boolean,ready:boolean,rows:number,error:string}>} */ ({}),
     rows: 0,
     lastError: '',
     lastOk: '',
@@ -78,7 +76,6 @@
     return parseFloat(m[1]) / 100;
   }
 
-  /** 集思录无指数涨幅（跨市场等，如日经 ETF 显示 -） */
   function isIndexUnavailable(raw) {
     const t = normalizeText(raw);
     if (!t) return true;
@@ -101,105 +98,14 @@
     return sign + v.toFixed(2) + '%';
   }
 
-  function calcEstimate(nav, indexRatio) {
-    if (nav == null || indexRatio == null || nav <= 0) return null;
-    return nav * (1 + indexRatio * CONFIG.STOCK_RATIO);
+  function calcT1Estimate(t2Nav, indexRatio) {
+    if (t2Nav == null || indexRatio == null || t2Nav <= 0) return null;
+    return t2Nav * (1 + indexRatio * CONFIG.STOCK_RATIO);
   }
 
   function calcPremium(price, estimate) {
     if (price == null || estimate == null || estimate <= 0) return null;
     return ((price - estimate) / estimate) * 100;
-  }
-
-  const SHANGHAI_TZ = 'Asia/Shanghai';
-
-  function getShanghaiCalendarParts(now = new Date()) {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: SHANGHAI_TZ,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).formatToParts(now);
-    const pick = (type) => Number(parts.find((p) => p.type === type).value);
-    return { y: pick('year'), m: pick('month'), d: pick('day') };
-  }
-
-  function weekdayShanghai(now = new Date()) {
-    const w = new Intl.DateTimeFormat('en-US', {
-      timeZone: SHANGHAI_TZ,
-      weekday: 'short',
-    }).format(now);
-    const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-    return map[w] ?? 0;
-  }
-
-  function ymdToString(y, m, d) {
-    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-  }
-
-  function addCalendarDays(y, m, d, delta) {
-    const t = Date.UTC(y, m - 1, d + delta);
-    const dt = new Date(t);
-    return {
-      y: dt.getUTCFullYear(),
-      m: dt.getUTCMonth() + 1,
-      d: dt.getUTCDate(),
-    };
-  }
-
-  /** 周一至周五=当天；周六日=上周五（节假日未单独处理） */
-  function getSessionDayYmd(now = new Date()) {
-    const parts = getShanghaiCalendarParts(now);
-    const wd = weekdayShanghai(now);
-    if (wd === 6) {
-      const p = addCalendarDays(parts.y, parts.m, parts.d, -1);
-      return ymdToString(p.y, p.m, p.d);
-    }
-    if (wd === 0) {
-      const p = addCalendarDays(parts.y, parts.m, parts.d, -2);
-      return ymdToString(p.y, p.m, p.d);
-    }
-    return ymdToString(parts.y, parts.m, parts.d);
-  }
-
-  function inferYearForMonthDay(m, d, refY, refM, refD) {
-    let y = refY;
-    const navOrd = m * 100 + d;
-    const refOrd = refM * 100 + refD;
-    if (navOrd > refOrd + 50) y = refY - 1;
-    return y;
-  }
-
-  function parseNavDateYmd(raw, refSessionYmd) {
-    const t = normalizeText(raw);
-    if (!t || t === '-' || t === '--') return null;
-
-    let y;
-    let m;
-    let d;
-
-    const full = t.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
-    if (full) {
-      y = Number(full[1]);
-      m = Number(full[2]);
-      d = Number(full[3]);
-    } else {
-      const md = t.match(/^(\d{1,2})[-/.](\d{1,2})$/);
-      if (!md) return null;
-      m = Number(md[1]);
-      d = Number(md[2]);
-      if (!refSessionYmd) return null;
-      const [refY, refM, refD] = refSessionYmd.split('-').map(Number);
-      y = inferYearForMonthDay(m, d, refY, refM, refD);
-    }
-
-    if (!y || m < 1 || m > 12 || d < 1 || d > 31) return null;
-    return ymdToString(y, m, d);
-  }
-
-  function isNavCoversSessionDay(navDateYmd, sessionDayYmd) {
-    if (!navDateYmd || !sessionDayYmd) return false;
-    return navDateYmd >= sessionDayYmd;
   }
 
   function isActivePage() {
@@ -208,17 +114,12 @@
     return hash === CONFIG.HASH || hash.startsWith(CONFIG.HASH + '&');
   }
 
-  /** 解析 FlexGrid：表头与表体可能是两个 table */
-  function resolveGrid() {
-    const root = document.getElementById(CONFIG.TABLE_ROOT_ID);
+  function resolveGrid(tableRootId) {
+    const root = document.getElementById(tableRootId);
     if (!root) return null;
 
     if (root.tagName === 'TABLE') {
-      return {
-        root,
-        headerTable: root,
-        bodyTable: root,
-      };
+      return { root, headerTable: root, bodyTable: root, tableId: tableRootId };
     }
 
     const grid = root.classList.contains('flexigrid')
@@ -238,13 +139,19 @@
 
     if (!bodyTable && root.querySelector('table')) {
       const t = root.querySelector('table');
-      return { root: grid, headerTable: headerTable || t, bodyTable: t };
+      return {
+        root: grid,
+        headerTable: headerTable || t,
+        bodyTable: t,
+        tableId: tableRootId,
+      };
     }
 
     return {
       root: grid,
       headerTable: headerTable || bodyTable,
       bodyTable: bodyTable || headerTable,
+      tableId: tableRootId,
     };
   }
 
@@ -252,8 +159,7 @@
     if (!headerTable) return null;
     const thead = headerTable.querySelector('thead');
     if (!thead) {
-      const tr = headerTable.querySelector('tr');
-      return tr || null;
+      return headerTable.querySelector('tr') || null;
     }
     const rows = thead.querySelectorAll('tr');
     for (let i = rows.length - 1; i >= 0; i--) {
@@ -268,7 +174,7 @@
   }
 
   function buildColumnMap(headerRow) {
-    const map = {};
+    const map = { indexColName: 'T-1指数涨幅' };
     const ths = headerRow.querySelectorAll('th');
     ths.forEach((th, i) => {
       if (th.hasAttribute(MARK_HEADER_EST) || th.hasAttribute(MARK_HEADER_PREM)) {
@@ -276,11 +182,22 @@
       }
       const label = headerLabel(th);
       if (!label) return;
-      if (label.includes('指数涨幅')) map.indexPct = i;
-      else if (label === '现价' || label.endsWith('现价')) map.price = i;
+      if (label.includes('参考标的期间涨幅')) {
+        map.indexPct = i;
+        map.indexColName = '参考标的期间涨幅';
+      } else if (label.includes('T-1') && label.includes('指数涨幅')) {
+        map.indexPct = i;
+        map.indexColName = 'T-1指数涨幅';
+      } else if (label === '现价' || label.endsWith('现价')) map.price = i;
       else if (label === '名称' || label.includes('名称')) map.name = i;
       else if (label.includes('净值日期')) map.navDate = i;
-      else if (label.includes('净值') && !label.includes('溢价')) map.nav = i;
+      else if (
+        label.includes('T-2') &&
+        label.includes('净值') &&
+        !label.includes('溢价')
+      ) {
+        map.nav = i;
+      }
     });
     return map;
   }
@@ -308,17 +225,17 @@
   }
 
   function injectStyles() {
-    let style = document.querySelector('style[data-jsl-lof-estimate-styles]');
+    let style = document.querySelector('style[data-jsl-qdiie-t1-styles]');
     if (!style) {
       style = document.createElement('style');
-      style.setAttribute('data-jsl-lof-estimate-styles', 'true');
+      style.setAttribute('data-jsl-qdiie-t1-styles', 'true');
       document.head.appendChild(style);
     }
     style.textContent = `
       th[${MARK_HEADER_EST}], th[${MARK_HEADER_PREM}],
       td[${MARK_EST}], td[${MARK_PREM}] {
         text-align: center; white-space: nowrap;
-        width: 1%; min-width: 72px; max-width: 88px;
+        width: 1%; min-width: 72px; max-width: 96px;
         padding: 2px 5px !important;
         box-sizing: border-box;
       }
@@ -332,63 +249,62 @@
         background: linear-gradient(180deg, #1565c0 0%, #0d47a1 100%) !important;
         color: #fff !important;
         font-weight: 700 !important;
-        font-size: 14px !important;
+        font-size: 13px !important;
         line-height: 1.2;
         text-shadow: 0 1px 0 rgba(0,0,0,.15);
       }
       th[${MARK_HEADER_PREM}] { cursor: pointer; user-select: none; }
-      #jsl-lof-estimate-refresh {
+      #jsl-qdiie-t1-refresh {
         margin: 4px 0; padding: 4px 12px; font-size: 12px; cursor: pointer;
         border: 1px solid #86c5e3; background: #f0f9ff; border-radius: 3px;
       }
-      #jsl-lof-estimate-status {
-        position: fixed; left: 8px; bottom: 8px; z-index: 99999;
-        max-width: 420px; font-size: 11px; line-height: 1.45;
+      #jsl-qdiie-t1-status {
+        position: fixed; left: 8px; bottom: 8px; z-index: 99998;
+        max-width: 440px; font-size: 11px; line-height: 1.45;
         background: rgba(255,255,255,0.96); border: 1px solid #86c5e3;
         border-radius: 6px; padding: 8px 10px; box-shadow: 0 2px 8px rgba(0,0,0,.12);
         color: #333;
       }
-      #jsl-lof-estimate-status .ok { color: #15803d; }
-      #jsl-lof-estimate-status .err { color: #b45309; }
+      #jsl-qdiie-t1-status .ok { color: #15803d; }
+      #jsl-qdiie-t1-status .err { color: #b45309; }
     `;
   }
 
   function updateStatusPanel() {
     injectStyles();
-    let el = document.getElementById('jsl-lof-estimate-status');
+    let el = document.getElementById('jsl-qdiie-t1-status');
     if (!el) {
       el = document.createElement('div');
-      el.id = 'jsl-lof-estimate-status';
+      el.id = 'jsl-qdiie-t1-status';
       document.body.appendChild(el);
     }
+    const tableLines = CONFIG.TABLES.map((t) => {
+      const s = status.tables[t.id] || {};
+      const mark = s.ready ? '✓' : s.found ? '…' : '✗';
+      const extra = s.error ? ` <span class="err">${s.error}</span>` : ` ${s.rows || 0}行`;
+      return `#${t.id}(${t.label}): ${mark}${extra}`;
+    });
     const lines = [
-      `<b>亚洲市场估值脚本 v${status.version}</b>`,
-      `页面: ${status.pageOk ? '<span class="ok">亚洲市场 #qdiia ✓</span>' : '<span class="err">请打开 亚洲市场 (#qdiia)</span>'}`,
-      `容器 #flex_qdiia: ${status.rootFound ? '✓' : '✗ 未找到'}`,
-      `表头 table: ${status.headerFound ? '✓' : '✗'}`,
-      `表体 table: ${status.bodyFound ? '✓' : '✗'}`,
-      `数据就绪: ${status.ready ? '✓' : '等待加载…'}`,
-      status.colMap
-        ? `列映射: 净值=#${status.colMap.nav} 指数=#${status.colMap.indexPct} 现价=#${status.colMap.price}`
-        : '列映射: 未完成',
-      `会话日(沪): ${status.sessionDay || getSessionDayYmd()}`,
-      `已处理行: ${status.rows}`,
+      `<b>欧美/商品 T-1 估值 v${status.version}</b>`,
+      `页面: ${status.pageOk ? '<span class="ok">#qdiie ✓</span>' : '<span class="err">请打开 欧美市场 (#qdiie)</span>'}`,
+      ...tableLines,
+      `合计行: ${status.rows}`,
       status.lastOk ? `<span class="ok">${status.lastOk}</span>` : '',
       status.lastError ? `<span class="err">${status.lastError}</span>` : '',
-      '<button type="button" id="jsl-lof-estimate-refresh">立即插入/刷新两列</button>',
+      '<button type="button" id="jsl-qdiie-t1-refresh">立即插入/刷新两列</button>',
     ].filter(Boolean);
     el.innerHTML = lines.join('<br>');
-    const btn = el.querySelector('#jsl-lof-estimate-refresh');
+    const btn = el.querySelector('#jsl-qdiie-t1-refresh');
     if (btn && !btn.dataset.bound) {
       btn.dataset.bound = '1';
       btn.addEventListener('click', () => {
-        frozenColMap = null;
+        frozenColMaps = {};
         runEnhance(true);
       });
     }
   }
 
-  function ensureHeaders(headerTable, headerRow, anchorTh, bodyTable) {
+  function ensureHeaders(headerRow, anchorTh, bodyTable, tableId) {
     let estTh = headerRow.querySelector(`th[${MARK_HEADER_EST}]`);
     let premTh = headerRow.querySelector(`th[${MARK_HEADER_PREM}]`);
 
@@ -400,35 +316,35 @@
     }
     estTh.textContent = CONFIG.ESTIMATE_HEADER;
     estTh.title =
-      '净值 × (1 + 指数涨幅 × 95%)，不含汇率；盘前净值为上一交易日';
+      'T-2净值 × (1 + T-1指数涨幅 × 95%)，不含汇率；商品表用「参考标的期间涨幅」(会员)';
 
     if (!premTh) {
       premTh = document.createElement('th');
       premTh.className = 'header sticky';
       premTh.setAttribute(MARK_HEADER_PREM, 'true');
       estTh.after(premTh);
-      premTh.addEventListener('click', () => sortByPremium(bodyTable));
+      premTh.addEventListener('click', () =>
+        sortByPremium(bodyTable, headerRow, tableId)
+      );
     }
     syncPremiumHeaderLabel(premTh);
-    premTh.title = '(现价 − 实时估值) / 实时估值 × 100%';
+    premTh.title = '(现价 − T-1日估值) / T-1日估值 × 100%';
   }
 
   function syncPremiumHeaderLabel(premTh) {
-    const span = premTh.querySelector('.jsl-prem-sort-indicator');
+    const span = premTh.querySelector('.jsl-t1-prem-sort-indicator');
     const sortMark = span ? span.textContent : '';
     premTh.innerHTML =
       CONFIG.PREMIUM_HEADER +
-      ' <span class="jsl-prem-sort-indicator">' +
+      ' <span class="jsl-t1-prem-sort-indicator">' +
       sortMark +
       '</span>';
   }
 
   function getCustomColumnIndexes(headerRow) {
     const estTh = headerRow.querySelector(`th[${MARK_HEADER_EST}]`);
-    const premTh = headerRow.querySelector(`th[${MARK_HEADER_PREM}]`);
     return {
       estIdx: estTh ? Array.from(headerRow.children).indexOf(estTh) : -1,
-      premIdx: premTh ? Array.from(headerRow.children).indexOf(premTh) : -1,
     };
   }
 
@@ -459,7 +375,7 @@
     return { estCell, premCell };
   }
 
-  function fillRow(row, colMap, headerRow, sessionDayYmd) {
+  function fillRow(row, colMap, headerRow) {
     try {
       const cells = row.querySelectorAll('td');
       if (cells.length < 3 || colMap.nav == null || colMap.indexPct == null) {
@@ -474,16 +390,13 @@
         colMap.price != null
           ? parseNumber(cells[colMap.price]?.textContent)
           : null;
-      const nav =
+      const t2Nav =
         colMap.nav != null ? parseNumber(cells[colMap.nav]?.textContent) : null;
-      const navDateRaw =
-        colMap.navDate != null ? cells[colMap.navDate]?.textContent : null;
-      const navDateYmd = parseNavDateYmd(navDateRaw, sessionDayYmd);
-      const navPublished = isNavCoversSessionDay(navDateYmd, sessionDayYmd);
       const indexRaw =
         colMap.indexPct != null ? cells[colMap.indexPct]?.textContent : null;
       const indexUnavailable = isIndexUnavailable(indexRaw);
       const indexR = indexUnavailable ? null : parsePercent(indexRaw);
+      const indexName = colMap.indexColName || 'T-1指数涨幅';
 
       const { estIdx } = getCustomColumnIndexes(headerRow);
       const pair = ensureBodyCells(row, estIdx);
@@ -496,43 +409,16 @@
         premCell.textContent = UNAVAILABLE;
         premCell.style.color = '';
         premCell.removeAttribute('data-premium-val');
-        estCell.title =
-          `${name || ''}\n指数涨幅不可用（如跨市场品种），无法按指数估算`;
+        const reason =
+          indexName === '参考标的期间涨幅'
+            ? '参考标的期间涨幅不可用（非会员或暂无数据）'
+            : 'T-1指数涨幅不可用';
+        estCell.title = `${name || ''}\n${reason}`;
         premCell.title = estCell.title;
         return true;
       }
 
-      if (navPublished) {
-        estCell.textContent = UNAVAILABLE;
-        const premium = calcPremium(price, nav);
-        premCell.textContent = formatPremium(premium, false);
-        if (premium != null) {
-          premCell.style.color =
-            premium >= 0 ? CONFIG.POSITIVE_COLOR : CONFIG.NEGATIVE_COLOR;
-          premCell.setAttribute('data-premium-val', String(premium));
-        } else {
-          premCell.style.color = '';
-          premCell.removeAttribute('data-premium-val');
-        }
-        const tip = [
-          `名称: ${name || '--'}`,
-          `会话日: ${sessionDayYmd}`,
-          `净值日期: ${navDateYmd || (navDateRaw || '').trim() || '--'}`,
-          `净值已覆盖会话日，不再按指数估算`,
-          `现价: ${price ?? '--'}`,
-          `净值: ${nav ?? '--'}`,
-          `实时溢价率 = (现价 - 净值) / 净值`,
-          premium != null ? `= ${formatPremium(premium, false)}` : '',
-          `现价为场内最近成交价，休市后不再更新`,
-        ]
-          .filter(Boolean)
-          .join('\n');
-        estCell.title = tip;
-        premCell.title = tip;
-        return true;
-      }
-
-      const estimate = calcEstimate(nav, indexR);
+      const estimate = calcT1Estimate(t2Nav, indexR);
       const premium = calcPremium(price, estimate);
       estCell.textContent = formatEstimate(estimate, false);
       premCell.textContent = formatPremium(premium, false);
@@ -547,14 +433,12 @@
 
       const tip = [
         `名称: ${name || '--'}`,
-        `会话日: ${sessionDayYmd}`,
-        `净值日期: ${navDateYmd || (navDateRaw || '').trim() || '--'}`,
         `现价: ${price ?? '--'}`,
-        `净值: ${nav ?? '--'}`,
-        `指数涨幅: ${(indexRaw || '').trim() || '--'}`,
-        `实时估值 = 净值 × (1 + 指数涨幅 × ${CONFIG.STOCK_RATIO})`,
+        `T-2净值: ${t2Nav ?? '--'}`,
+        `${indexName}: ${(indexRaw || '').trim() || '--'}`,
+        `T-1日估值 = T-2净值 × (1 + ${indexName} × ${CONFIG.STOCK_RATIO})`,
         estimate != null ? `= ${formatEstimate(estimate, false)}` : '',
-        `实时溢价率 = (现价 - 实时估值) / 实时估值`,
+        `T-1日估值溢价率 = (现价 - T-1日估值) / T-1日估值`,
         premium != null ? `= ${formatPremium(premium, false)}` : '',
       ]
         .filter(Boolean)
@@ -564,21 +448,20 @@
 
       return true;
     } catch (err) {
-      console.warn('[集思录LOF估值] 单行处理跳过:', err);
+      console.warn('[集思录T-1估值] 单行跳过:', err);
       return false;
     }
   }
 
-  let sortDir = null;
-
-  function sortByPremium(bodyTable) {
+  function sortByPremium(bodyTable, headerRow, tableId) {
     const tbody = bodyTable.querySelector('tbody');
-    const grid = resolveGrid();
-    const headerRow = grid ? getHeaderRow(grid.headerTable) : null;
     if (!tbody || !headerRow) return;
 
+    let sortDir = sortDirs.get(tableId) ?? null;
     sortDir = sortDir === null ? 'desc' : sortDir === 'desc' ? 'asc' : null;
-    const indicator = headerRow.querySelector('.jsl-prem-sort-indicator');
+    sortDirs.set(tableId, sortDir);
+
+    const indicator = headerRow.querySelector('.jsl-t1-prem-sort-indicator');
     if (indicator) {
       indicator.textContent =
         sortDir === 'desc' ? '↓' : sortDir === 'asc' ? '↑' : '';
@@ -603,142 +486,128 @@
     rows.forEach((r) => tbody.appendChild(r));
   }
 
-  function disconnectBodyObserver() {
-    if (bodyObserver) {
-      bodyObserver.disconnect();
-      bodyObserver = null;
-    }
+  function disconnectAllObservers() {
+    for (const ob of gridObservers.values()) ob.disconnect();
+    gridObservers.clear();
   }
 
-  function enhanceGrid() {
-    status.pageOk = isActivePage();
-    status.rootFound = false;
-    status.headerFound = false;
-    status.bodyFound = false;
-    status.ready = false;
-    status.lastError = '';
-    status.rows = 0;
-
-    if (!status.pageOk) {
-      status.lastError = '当前不是亚洲市场 Tab，请点顶部「亚洲市场」';
-      updateStatusPanel();
-      return false;
-    }
-
-    const grid = resolveGrid();
-    if (!grid) {
-      status.lastError = '未找到 #flex_qdiia，请等表格加载或刷新页面';
-      updateStatusPanel();
-      return false;
-    }
-
-    status.rootFound = true;
-    status.headerFound = !!grid.headerTable;
-    status.bodyFound = !!grid.bodyTable;
-
-    if (!grid.headerTable || !grid.bodyTable) {
-      status.lastError = 'FlexGrid 表头/表体未分离成功，见 Console';
-      console.warn('[集思录LOF估值] grid', grid);
-      updateStatusPanel();
-      return false;
-    }
-
-    if (!tableReady(grid)) {
-      status.lastError = '表格数据未就绪（可能仍在加载）';
-      updateStatusPanel();
-      return false;
-    }
-
-    status.ready = true;
-    const headerRow = getHeaderRow(grid.headerTable);
-    if (!headerRow) {
-      status.lastError = '找不到表头行';
-      updateStatusPanel();
-      return false;
-    }
-
-    let colMap = frozenColMap;
-    if (!colMap) {
-      colMap = buildColumnMap(headerRow);
-      if (colMap.nav == null || colMap.indexPct == null) {
-        const labels = Array.from(headerRow.querySelectorAll('th')).map(headerLabel);
-        status.lastError =
-          '列映射失败，表头文字: ' + labels.slice(0, 16).join(' | ');
-        console.warn('[集思录LOF估值] 表头', labels, colMap);
-        updateStatusPanel();
-        return false;
-      }
-      frozenColMap = { ...colMap };
-    }
-    status.colMap = colMap;
-
-    disconnectBodyObserver();
-    try {
-      const anchor = findAnchorHeader(headerRow, colMap);
-      if (!anchor) {
-        status.lastError = '找不到插入列的位置';
-        return false;
-      }
-      ensureHeaders(grid.headerTable, headerRow, anchor, grid.bodyTable);
-
-      const sessionDayYmd = getSessionDayYmd();
-      status.sessionDay = sessionDayYmd;
-
-      const rows = grid.bodyTable.querySelectorAll('tbody tr');
-      rows.forEach((row) => {
-        if (fillRow(row, colMap, headerRow, sessionDayYmd)) status.rows++;
-      });
-
-      status.lastOk =
-        status.rows > 0
-          ? `已插入两列并计算 ${status.rows} 行（LOF/ETF 同算法）`
-          : '表头已插入，但未处理到数据行';
-    } finally {
-      observeBody(grid.bodyTable, grid.headerTable, colMap);
-    }
-
-    updateStatusPanel();
-    return true;
-  }
-
-  function observeBody(bodyTable, headerTable, colMap) {
-    disconnectBodyObserver();
+  function observeBody(bodyTable, headerTable, colMap, tableId) {
     const tbody = bodyTable.querySelector('tbody');
     if (!tbody) return;
     const headerRow = getHeaderRow(headerTable);
+    if (!headerRow) return;
 
-    bodyObserver = new MutationObserver((mutations) => {
-      let refresh = false;
+    const prev = gridObservers.get(tableId);
+    if (prev) prev.disconnect();
+
+    const observer = new MutationObserver((mutations) => {
       for (const m of mutations) {
         if (m.type !== 'childList') continue;
         for (const node of m.addedNodes) {
           if (node.nodeType === 1 && node.tagName === 'TR') {
-            fillRow(node, colMap, headerRow, getSessionDayYmd());
-            refresh = true;
+            fillRow(node, colMap, headerRow);
           }
         }
       }
-      if (refresh) {
-        status.rows = bodyTable.querySelectorAll(`td[${MARK_EST}]`).length;
-        updateStatusPanel();
-      }
     });
-    bodyObserver.observe(tbody, { childList: true, subtree: false });
+    observer.observe(tbody, { childList: true, subtree: false });
+    gridObservers.set(tableId, observer);
   }
 
-  function scheduleEnhance() {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => runEnhance(false), CONFIG.DEBOUNCE_MS);
+  function enhanceOneGrid(tableDef) {
+    const tableId = tableDef.id;
+    const st = { found: false, ready: false, rows: 0, error: '' };
+    status.tables[tableId] = st;
+
+    const grid = resolveGrid(tableId);
+    if (!grid || !grid.bodyTable) {
+      st.error = '未找到容器';
+      return 0;
+    }
+    st.found = true;
+
+    if (!grid.headerTable || !tableReady(grid)) {
+      st.error = '未就绪';
+      return 0;
+    }
+    st.ready = true;
+
+    const headerRow = getHeaderRow(grid.headerTable);
+    if (!headerRow) {
+      st.error = '无表头';
+      return 0;
+    }
+
+    let colMap = frozenColMaps[tableId];
+    if (!colMap) {
+      colMap = buildColumnMap(headerRow);
+      if (colMap.nav == null || colMap.indexPct == null) {
+        const labels = Array.from(headerRow.querySelectorAll('th')).map(headerLabel);
+        st.error = '列映射失败';
+        console.warn('[集思录T-1估值]', tableId, labels, colMap);
+        return 0;
+      }
+      frozenColMaps[tableId] = { ...colMap };
+    }
+
+    const anchor = findAnchorHeader(headerRow, colMap);
+    if (!anchor) {
+      st.error = '无锚点列';
+      return 0;
+    }
+
+    ensureHeaders(headerRow, anchor, grid.bodyTable, tableId);
+
+    const rows = grid.bodyTable.querySelectorAll('tbody tr');
+    let n = 0;
+    rows.forEach((row) => {
+      if (fillRow(row, colMap, headerRow)) n++;
+    });
+    st.rows = n;
+    observeBody(grid.bodyTable, grid.headerTable, colMap, tableId);
+    return n;
+  }
+
+  function enhanceAllGrids() {
+    status.pageOk = isActivePage();
+    status.lastError = '';
+    status.lastOk = '';
+    status.rows = 0;
+
+    if (!status.pageOk) {
+      status.lastError = '请打开 欧美市场 Tab (#qdiie)';
+      updateStatusPanel();
+      return false;
+    }
+
+    disconnectAllObservers();
+    let anyReady = false;
+    for (const t of CONFIG.TABLES) {
+      const n = enhanceOneGrid(t);
+      status.rows += n;
+      if (status.tables[t.id]?.ready) anyReady = true;
+    }
+
+    if (!anyReady) {
+      status.lastError = status.lastError || '两个表格均未就绪，请等待加载';
+    } else if (status.rows > 0) {
+      status.lastOk = `已处理 ${status.rows} 行（欧美+商品，LOF/ETF 同算法）`;
+    } else {
+      status.lastOk = '表头已插入，等待数据行';
+    }
+
+    updateStatusPanel();
+    return anyReady;
   }
 
   function runEnhance(force) {
     if (enhancing && !force) return;
     enhancing = true;
     try {
-      enhanceGrid();
+      enhanceAllGrids();
     } catch (err) {
       status.lastError = '异常: ' + err.message;
-      console.error('[集思录LOF估值]', err);
+      console.error('[集思录T-1估值]', err);
       updateStatusPanel();
     } finally {
       enhancing = false;
@@ -763,9 +632,9 @@
 
     if (!hashListenerBound) {
       window.addEventListener('hashchange', () => {
-        frozenColMap = null;
-        sortDir = null;
-        disconnectBodyObserver();
+        frozenColMaps = {};
+        sortDirs.clear();
+        disconnectAllObservers();
         runEnhance(true);
       });
       hashListenerBound = true;
@@ -773,5 +642,5 @@
   }
 
   init();
-  console.log('[集思录LOF估值] v1.3.1 — 无指数涨幅显示 -');
+  console.log('[集思录T-1估值] v1.0.0 — #qdiie flex_qdiie + flex_qdiic');
 })();
