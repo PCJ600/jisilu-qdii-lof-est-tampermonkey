@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         集思录欧美/商品QDII T-1估值(95%指数)
 // @namespace    https://github.com/local/jisilu-qdiia-lof
-// @version      1.0.0
+// @version      1.1.1
 // @description  在集思录 QDII #qdiie 欧美(flex_qdiie)与商品(flex_qdiic)表增加 T-1日估值/T-1日估值溢价率
 // @author       local
 // @match        https://www.jisilu.cn/data/qdii/*
@@ -46,7 +46,8 @@
   let frozenColMaps = {};
 
   const status = {
-    version: '1.0.0',
+    version: '1.1.1',
+    sessionDay: '',
     pageOk: false,
     tables: /** @type {Record<string, {found:boolean,ready:boolean,rows:number,error:string}>} */ ({}),
     rows: 0,
@@ -106,6 +107,116 @@
   function calcPremium(price, estimate) {
     if (price == null || estimate == null || estimate <= 0) return null;
     return ((price - estimate) / estimate) * 100;
+  }
+
+  const SHANGHAI_TZ = 'Asia/Shanghai';
+
+  function getShanghaiCalendarParts(now = new Date()) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: SHANGHAI_TZ,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(now);
+    const pick = (type) => Number(parts.find((p) => p.type === type).value);
+    return { y: pick('year'), m: pick('month'), d: pick('day') };
+  }
+
+  function weekdayShanghai(now = new Date()) {
+    const w = new Intl.DateTimeFormat('en-US', {
+      timeZone: SHANGHAI_TZ,
+      weekday: 'short',
+    }).format(now);
+    const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    return map[w] ?? 0;
+  }
+
+  function ymdToString(y, m, d) {
+    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  }
+
+  function addCalendarDays(y, m, d, delta) {
+    const t = Date.UTC(y, m - 1, d + delta);
+    const dt = new Date(t);
+    return {
+      y: dt.getUTCFullYear(),
+      m: dt.getUTCMonth() + 1,
+      d: dt.getUTCDate(),
+    };
+  }
+
+  function shiftYmd(ymd, deltaDays) {
+    const [y, m, d] = ymd.split('-').map(Number);
+    const p = addCalendarDays(y, m, d, deltaDays);
+    return ymdToString(p.y, p.m, p.d);
+  }
+
+  function getSessionDayYmd(now = new Date()) {
+    const parts = getShanghaiCalendarParts(now);
+    const wd = weekdayShanghai(now);
+    if (wd === 6) {
+      const p = addCalendarDays(parts.y, parts.m, parts.d, -1);
+      return ymdToString(p.y, p.m, p.d);
+    }
+    if (wd === 0) {
+      const p = addCalendarDays(parts.y, parts.m, parts.d, -2);
+      return ymdToString(p.y, p.m, p.d);
+    }
+    return ymdToString(parts.y, parts.m, parts.d);
+  }
+
+  function inferYearForMonthDay(m, d, refY, refM, refD) {
+    let y = refY;
+    const navOrd = m * 100 + d;
+    const refOrd = refM * 100 + refD;
+    if (navOrd > refOrd + 50) y = refY - 1;
+    return y;
+  }
+
+  function parseTwoDigitYear(yy) {
+    const n = Number(yy);
+    if (!Number.isFinite(n)) return null;
+    return n >= 70 ? 1900 + n : 2000 + n;
+  }
+
+  function parseNavDateYmd(raw, refSessionYmd) {
+    const t = normalizeText(raw);
+    if (!t || t === '-' || t === '--') return null;
+
+    let y;
+    let m;
+    let d;
+
+    const full = t.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+    if (full) {
+      y = Number(full[1]);
+      m = Number(full[2]);
+      d = Number(full[3]);
+    } else {
+      const yymd = t.match(/^(\d{2})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+      if (yymd) {
+        y = parseTwoDigitYear(yymd[1]);
+        m = Number(yymd[2]);
+        d = Number(yymd[3]);
+      } else {
+        const md = t.match(/^(\d{1,2})[-/.](\d{1,2})$/);
+        if (!md) return null;
+        m = Number(md[1]);
+        d = Number(md[2]);
+        if (!refSessionYmd) return null;
+        const [refY, refM, refD] = refSessionYmd.split('-').map(Number);
+        y = inferYearForMonthDay(m, d, refY, refM, refD);
+      }
+    }
+
+    if (!y || m < 1 || m > 12 || d < 1 || d > 31) return null;
+    return ymdToString(y, m, d);
+  }
+
+  function shouldUseT1IndexEstimate(navDateYmd, sessionDayYmd) {
+    if (!navDateYmd || !sessionDayYmd) return true;
+    const cutoff = shiftYmd(sessionDayYmd, -1);
+    return navDateYmd < cutoff;
   }
 
   function isActivePage() {
@@ -288,6 +399,7 @@
       `<b>欧美/商品 T-1 估值 v${status.version}</b>`,
       `页面: ${status.pageOk ? '<span class="ok">#qdiie ✓</span>' : '<span class="err">请打开 欧美市场 (#qdiie)</span>'}`,
       ...tableLines,
+      `会话日(沪): ${status.sessionDay || getSessionDayYmd()}`,
       `合计行: ${status.rows}`,
       status.lastOk ? `<span class="ok">${status.lastOk}</span>` : '',
       status.lastError ? `<span class="err">${status.lastError}</span>` : '',
@@ -375,7 +487,16 @@
     return { estCell, premCell };
   }
 
-  function fillRow(row, colMap, headerRow) {
+  function setBothUnavailable(estCell, premCell, title) {
+    estCell.textContent = UNAVAILABLE;
+    premCell.textContent = UNAVAILABLE;
+    premCell.style.color = '';
+    premCell.removeAttribute('data-premium-val');
+    estCell.title = title;
+    premCell.title = title;
+  }
+
+  function fillRow(row, colMap, headerRow, sessionDayYmd) {
     try {
       const cells = row.querySelectorAll('td');
       if (cells.length < 3 || colMap.nav == null || colMap.indexPct == null) {
@@ -392,6 +513,9 @@
           : null;
       const t2Nav =
         colMap.nav != null ? parseNumber(cells[colMap.nav]?.textContent) : null;
+      const navDateRaw =
+        colMap.navDate != null ? cells[colMap.navDate]?.textContent : null;
+      const navDateYmd = parseNavDateYmd(navDateRaw, sessionDayYmd);
       const indexRaw =
         colMap.indexPct != null ? cells[colMap.indexPct]?.textContent : null;
       const indexUnavailable = isIndexUnavailable(indexRaw);
@@ -405,16 +529,41 @@
       const { estCell, premCell } = pair;
 
       if (indexUnavailable) {
-        estCell.textContent = UNAVAILABLE;
-        premCell.textContent = UNAVAILABLE;
-        premCell.style.color = '';
-        premCell.removeAttribute('data-premium-val');
         const reason =
           indexName === '参考标的期间涨幅'
             ? '参考标的期间涨幅不可用（非会员或暂无数据）'
             : 'T-1指数涨幅不可用';
-        estCell.title = `${name || ''}\n${reason}`;
-        premCell.title = estCell.title;
+        setBothUnavailable(
+          estCell,
+          premCell,
+          [
+            name ? `名称: ${name}` : '',
+            `不计算原因: ${reason}`,
+            'T-1日估值、T-1日估值溢价率均无法计算',
+          ]
+            .filter(Boolean)
+            .join('\n')
+        );
+        return true;
+      }
+
+      const useIndex = shouldUseT1IndexEstimate(navDateYmd, sessionDayYmd);
+      const cutoff = shiftYmd(sessionDayYmd, -1);
+
+      if (!useIndex) {
+        setBothUnavailable(
+          estCell,
+          premCell,
+          [
+            `名称: ${name || '--'}`,
+            `会话日(沪): ${sessionDayYmd}`,
+            `T-2净值日期: ${navDateYmd || (navDateRaw || '').trim() || '--'}`,
+            `阈值: 须严格早于 会话日−1（${cutoff}）才估 T-1`,
+            '不计算原因: T-2净值日期已滚到新日期（如周末已更新到周四）',
+            'T-2×T-1指数 模型失效；T-1日估值与 T-1日估值溢价率均无意义',
+            '（真实折溢价需结合更新后净值与后续交易日指数，本脚本不展示）',
+          ].join('\n')
+        );
         return true;
       }
 
@@ -433,6 +582,8 @@
 
       const tip = [
         `名称: ${name || '--'}`,
+        `会话日: ${sessionDayYmd}`,
+        `T-2净值日期: ${navDateYmd || (navDateRaw || '').trim() || '--'} (< 会话日−1 ${cutoff})`,
         `现价: ${price ?? '--'}`,
         `T-2净值: ${t2Nav ?? '--'}`,
         `${indexName}: ${(indexRaw || '').trim() || '--'}`,
@@ -505,7 +656,7 @@
         if (m.type !== 'childList') continue;
         for (const node of m.addedNodes) {
           if (node.nodeType === 1 && node.tagName === 'TR') {
-            fillRow(node, colMap, headerRow);
+            fillRow(node, colMap, headerRow, getSessionDayYmd());
           }
         }
       }
@@ -558,10 +709,13 @@
 
     ensureHeaders(headerRow, anchor, grid.bodyTable, tableId);
 
+    const sessionDayYmd = getSessionDayYmd();
+    status.sessionDay = sessionDayYmd;
+
     const rows = grid.bodyTable.querySelectorAll('tbody tr');
     let n = 0;
     rows.forEach((row) => {
-      if (fillRow(row, colMap, headerRow)) n++;
+      if (fillRow(row, colMap, headerRow, sessionDayYmd)) n++;
     });
     st.rows = n;
     observeBody(grid.bodyTable, grid.headerTable, colMap, tableId);
@@ -642,5 +796,5 @@
   }
 
   init();
-  console.log('[集思录T-1估值] v1.0.0 — #qdiie flex_qdiie + flex_qdiic');
+  console.log('[集思录T-1估值] v1.1.1 — 停估时两列均为 -');
 })();

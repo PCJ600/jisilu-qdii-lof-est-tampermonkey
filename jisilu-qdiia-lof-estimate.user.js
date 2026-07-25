@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         集思录亚洲LOF实时估值(95%指数)
 // @namespace    https://github.com/local/jisilu-qdiia-lof
-// @version      1.4.0
+// @version      1.4.1
 // @description  在集思录 QDII 亚洲市场（LOF/ETF 等）增加「实时估值」「实时溢价率」
 // @author       local
 // @match        https://www.jisilu.cn/data/qdii/*
@@ -43,7 +43,7 @@
   let frozenColMap = null;
 
   const status = {
-    version: '1.4.0',
+    version: '1.4.1',
     pageOk: false,
     rootFound: false,
     headerFound: false,
@@ -459,6 +459,15 @@
     return { estCell, premCell };
   }
 
+  function setBothUnavailable(estCell, premCell, title) {
+    estCell.textContent = UNAVAILABLE;
+    premCell.textContent = UNAVAILABLE;
+    premCell.style.color = '';
+    premCell.removeAttribute('data-premium-val');
+    estCell.title = title;
+    premCell.title = title;
+  }
+
   function fillRow(row, colMap, headerRow, sessionDayYmd) {
     try {
       const cells = row.querySelectorAll('td');
@@ -492,43 +501,33 @@
       const { estCell, premCell } = pair;
 
       if (indexUnavailable) {
-        estCell.textContent = UNAVAILABLE;
-        premCell.textContent = UNAVAILABLE;
-        premCell.style.color = '';
-        premCell.removeAttribute('data-premium-val');
-        estCell.title =
-          `${name || ''}\n指数涨幅不可用（如跨市场品种），无法按指数估算`;
-        premCell.title = estCell.title;
+        setBothUnavailable(
+          estCell,
+          premCell,
+          [
+            name ? `名称: ${name}` : '',
+            '不计算原因: 指数涨幅不可用（如跨市场品种显示 -）',
+            '实时估值、实时溢价率均无法按指数模型估算',
+          ]
+            .filter(Boolean)
+            .join('\n')
+        );
         return true;
       }
 
       if (navPublished) {
-        estCell.textContent = UNAVAILABLE;
-        const premium = calcPremium(price, nav);
-        premCell.textContent = formatPremium(premium, false);
-        if (premium != null) {
-          premCell.style.color =
-            premium >= 0 ? CONFIG.POSITIVE_COLOR : CONFIG.NEGATIVE_COLOR;
-          premCell.setAttribute('data-premium-val', String(premium));
-        } else {
-          premCell.style.color = '';
-          premCell.removeAttribute('data-premium-val');
-        }
-        const tip = [
-          `名称: ${name || '--'}`,
-          `会话日: ${sessionDayYmd}`,
-          `净值日期: ${navDateYmd || (navDateRaw || '').trim() || '--'}`,
-          `净值已覆盖会话日，不再按指数估算`,
-          `现价: ${price ?? '--'}`,
-          `净值: ${nav ?? '--'}`,
-          `实时溢价率 = (现价 - 净值) / 净值`,
-          premium != null ? `= ${formatPremium(premium, false)}` : '',
-          `现价为场内最近成交价，休市后不再更新`,
-        ]
-          .filter(Boolean)
-          .join('\n');
-        estCell.title = tip;
-        premCell.title = tip;
+        setBothUnavailable(
+          estCell,
+          premCell,
+          [
+            `名称: ${name || '--'}`,
+            `会话日(沪): ${sessionDayYmd}`,
+            `净值日期: ${navDateYmd || (navDateRaw || '').trim() || '--'}`,
+            '不计算原因: 净值日期已不早于会话日，表格净值已含该会话及之前行情',
+            '再乘指数涨幅会重复计价；实时估值与相对该估算的实时溢价率均无意义',
+            '（可参考表内 IOPV/净值溢价率等官方列）',
+          ].join('\n')
+        );
         return true;
       }
 
